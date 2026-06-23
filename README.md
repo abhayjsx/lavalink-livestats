@@ -1,3 +1,5 @@
+# Made with ❤️ by dev @karma.ly
+
 # 🎵 Lavalink Live Stats Bot
 
 A **Discord.js v14** bot that posts and continuously updates a rich embed with live statistics from your **Lavalink v4** node — including CPU, memory, player counts, frame stats, and version info.
@@ -107,3 +109,6 @@ lavalink-livestats/
 ├── package.json
 └── README.md
 ```
+
+---
+Made with ❤️ by dev @karma.ly

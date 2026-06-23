@@ -1,8 +1,3 @@
-/**
- * Lavalink v4 REST API Client
- * Handles all HTTP communication with the Lavalink node
- */
-
 export class LavalinkClient {
   constructor(config) {
     this.host = config.host;
@@ -16,9 +11,6 @@ export class LavalinkClient {
     };
   }
 
-  /**
-   * Generic fetch wrapper with error handling
-   */
   async _request(endpoint) {
     const url = `${this.baseUrl}${endpoint}`;
     const controller = new AbortController();
@@ -46,28 +38,18 @@ export class LavalinkClient {
     }
   }
 
-  /**
-   * GET /v4/stats
-   * Returns Lavalink server statistics
-   */
   async getStats() {
     return this._request('/v4/stats');
   }
 
-  /**
-   * GET /v4/info
-   * Returns server version and build info
-   */
   async getInfo() {
     return this._request('/v4/info');
   }
 
-  /**
-   * GET /v4/sessions/{sessionId}/players
-   * Returns all players for a given session
-   */
   async getPlayers(sessionId) {
     if (!sessionId) return [];
     return this._request(`/v4/sessions/${sessionId}/players?trace=false`);
   }
 }
+
+// Made with <3 by dev @karma.ly
