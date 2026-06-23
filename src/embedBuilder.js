@@ -44,7 +44,7 @@ function statusDot(online) {
   return online ? '🟢' : '🔴';
 }
 
-export function buildStatsEmbed({ stats, info, players, online, nodeName, host, error }) {
+export function buildStatsEmbed({ stats, info, players, online, nodeName, host, error, updateInterval }) {
   const color = !online ? COLORS.offline : COLORS.online;
   const now = new Date();
 
@@ -201,8 +201,9 @@ export function buildStatsEmbed({ stats, info, players, online, nodeName, host, 
     }
   }
 
+  const updateSec = updateInterval ? Math.round(updateInterval / 1000) : 5;
   embed.setFooter({
-    text: `🔄 Updates every 5s  •  Lavalink v4`,
+    text: `🔄 Updates every ${updateSec}s  •  Lavalink v4`,
   });
 
   return embed;

@@ -7,19 +7,111 @@ import {
 import { LavalinkClient } from './lavalinkClient.js';
 import { buildStatsEmbed } from './embedBuilder.js';
 
-const REQUIRED_ENV = [
-  'DISCORD_TOKEN',
-  'STATS_CHANNEL_ID',
-  'LAVALINK_HOST',
-  'LAVALINK_PORT',
-  'LAVALINK_PASSWORD',
-];
+function log(level, ...args) {
+  const ts = new Date().toISOString();
+  const prefix = { INFO: '📘', WARN: '⚠️', ERR: '❌' }[level] ?? '  ';
+  console.log(`[${ts}] ${prefix} ${level}:`, ...args);
+}
 
-for (const key of REQUIRED_ENV) {
+class LavalinkNode {
+  constructor(index, config) {
+    this.index = index;
+    this.config = config;
+    this.client = new LavalinkClient(config);
+    this.cachedInfo = null;
+    this.consecutiveErrs = 0;
+    this.lastSessionId = null;
+    this.hostLabel = `${config.host}:${config.port}`;
+    this.online = false;
+    this.error = null;
+    this.stats = null;
+    this.players = [];
+  }
+
+  async fetchStats() {
+    try {
+      const [stats, info] = await Promise.all([
+        this.client.getStats(),
+        this.cachedInfo ? Promise.resolve(this.cachedInfo) : this.client.getInfo(),
+      ]);
+
+      if (!this.cachedInfo) {
+        this.cachedInfo = info;
+        log('INFO', `[Node ${this.index}] Lavalink version: ${info?.version?.semver ?? 'Unknown'}`);
+      }
+
+      let players = [];
+      if (this.lastSessionId) {
+        try {
+          players = await this.client.getPlayers(this.lastSessionId);
+        } catch {
+          // ignore
+        }
+      }
+
+      this.stats = stats;
+      this.online = true;
+      this.error = null;
+      this.players = players;
+      this.consecutiveErrs = 0;
+    } catch (err) {
+      this.online = false;
+      this.error = err.message;
+      this.consecutiveErrs++;
+      log('WARN', `[Node ${this.index}] Failed to fetch stats (${this.consecutiveErrs} consecutive): ${err.message}`);
+    }
+  }
+}
+
+// Validate required general discord variables
+const REQUIRED_DISCORD_ENV = ['DISCORD_TOKEN', 'STATS_CHANNEL_ID'];
+for (const key of REQUIRED_DISCORD_ENV) {
   if (!process.env[key]) {
     console.error(`❌ Missing required environment variable: ${key}`);
     process.exit(1);
   }
+}
+
+// Build node configs
+const nodesConfig = [];
+
+// Parse Node 1 (accepts LAVALINK_1_... or fallback to original legacy variables)
+const node1Host = process.env.LAVALINK_1_HOST ?? process.env.LAVALINK_HOST;
+const node1Port = process.env.LAVALINK_1_PORT ?? process.env.LAVALINK_PORT;
+const node1Password = process.env.LAVALINK_1_PASSWORD ?? process.env.LAVALINK_PASSWORD;
+const node1Secure = (process.env.LAVALINK_1_SECURE ?? process.env.LAVALINK_SECURE) === 'true';
+const node1Name = process.env.NODE_1_NAME ?? process.env.NODE_NAME ?? 'Lavalink Node 1';
+
+if (node1Host && node1Port && node1Password) {
+  nodesConfig.push({
+    host: node1Host,
+    port: parseInt(node1Port, 10),
+    password: node1Password,
+    secure: node1Secure,
+    name: node1Name,
+  });
+}
+
+// Parse Node 2
+const node2Host = process.env.LAVALINK_2_HOST;
+const node2Port = process.env.LAVALINK_2_PORT;
+const node2Password = process.env.LAVALINK_2_PASSWORD;
+const node2Secure = process.env.LAVALINK_2_SECURE === 'true';
+const node2Name = process.env.NODE_2_NAME ?? 'Lavalink Node 2';
+
+if (node2Host && node2Port && node2Password) {
+  nodesConfig.push({
+    host: node2Host,
+    port: parseInt(node2Port, 10),
+    password: node2Password,
+    secure: node2Secure,
+    name: node2Name,
+  });
+}
+
+if (nodesConfig.length === 0) {
+  console.error('❌ No Lavalink nodes configured. Please specify at least one node in your environment variables.');
+  process.exit(1);
 }
 
 const CONFIG = {
@@ -27,70 +119,41 @@ const CONFIG = {
     token: process.env.DISCORD_TOKEN,
     channelId: process.env.STATS_CHANNEL_ID,
   },
-  lavalink: {
-    host: process.env.LAVALINK_HOST,
-    port: parseInt(process.env.LAVALINK_PORT, 10),
-    password: process.env.LAVALINK_PASSWORD,
-    secure: process.env.LAVALINK_SECURE === 'true',
-  },
   updateInterval: parseInt(process.env.UPDATE_INTERVAL ?? '5000', 10),
-  nodeName: process.env.NODE_NAME ?? 'Lavalink Node',
 };
-
-const HOST_LABEL = `${CONFIG.lavalink.host}:${CONFIG.lavalink.port}`;
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
-const lavalink = new LavalinkClient(CONFIG.lavalink);
+const nodes = nodesConfig.map((cfg, idx) => new LavalinkNode(idx + 1, cfg));
 
 let statsMessage = null;
 let updateTimer = null;
-let cachedInfo = null;
-let consecutiveErrs = 0;
-let lastSessionId = null;
 
-function log(level, ...args) {
-  const ts = new Date().toISOString();
-  const prefix = { INFO: '📘', WARN: '⚠️', ERR: '❌' }[level] ?? '  ';
-  console.log(`[${ts}] ${prefix} ${level}:`, ...args);
-}
+function updatePresence(nodesList) {
+  const totalPlayingPlayers = nodesList.reduce((sum, n) => sum + (n.stats?.playingPlayers ?? 0), 0);
+  const totalOnline = nodesList.filter(n => n.online).length;
 
-function updatePresence(playingPlayers) {
-  const label = playingPlayers === 0
-    ? 'No active players'
-    : `${playingPlayers} player${playingPlayers === 1 ? '' : 's'}`;
+  let label = '';
+  let status = 'online';
+
+  if (totalOnline === 0) {
+    status = 'dnd';
+    label = 'Nodes Offline';
+  } else {
+    label = totalPlayingPlayers === 0
+      ? 'No active players'
+      : `${totalPlayingPlayers} player${totalPlayingPlayers === 1 ? '' : 's'}`;
+  }
 
   client.user?.setPresence({
-    status: 'online',
+    status: status,
     activities: [{
       name: label,
       type: ActivityType.Watching,
     }],
   });
-}
-
-async function fetchAllStats() {
-  const [stats, info] = await Promise.all([
-    lavalink.getStats(),
-    cachedInfo ? Promise.resolve(cachedInfo) : lavalink.getInfo(),
-  ]);
-
-  if (!cachedInfo) {
-    cachedInfo = info;
-    log('INFO', `Lavalink version: ${info?.version?.semver ?? 'Unknown'}`);
-  }
-
-  let players = [];
-  if (lastSessionId) {
-    try {
-      players = await lavalink.getPlayers(lastSessionId);
-    } catch {
-    }
-  }
-
-  return { stats, info: cachedInfo, players };
 }
 
 async function refreshStatsEmbed() {
@@ -100,51 +163,32 @@ async function refreshStatsEmbed() {
     return;
   }
 
-  let online = true;
-  let error = null;
-  let stats = null;
-  let info = cachedInfo;
-  let players = [];
+  // Fetch stats for all nodes in parallel
+  await Promise.all(nodes.map(node => node.fetchStats()));
 
-  try {
-    const result = await fetchAllStats();
-    stats = result.stats;
-    info = result.info;
-    players = result.players;
-    consecutiveErrs = 0;
-  } catch (err) {
-    online = false;
-    error = err.message;
-    consecutiveErrs++;
-    log('WARN', `Failed to fetch stats (${consecutiveErrs} consecutive): ${err.message}`);
-  }
-
-  const embed = buildStatsEmbed({
-    stats,
-    info,
-    players,
-    online,
-    nodeName: CONFIG.nodeName,
-    host: HOST_LABEL,
-    error,
-  });
+  const embeds = nodes.map(node => buildStatsEmbed({
+    stats: node.stats,
+    info: node.cachedInfo,
+    players: node.players,
+    online: node.online,
+    nodeName: node.config.name,
+    host: node.hostLabel,
+    error: node.error,
+    updateInterval: CONFIG.updateInterval,
+  }));
 
   try {
     if (statsMessage) {
-      await statsMessage.edit({ embeds: [embed] });
+      await statsMessage.edit({ embeds });
     } else {
       statsMessage = await channel.send({
         content: '',
-        embeds: [embed],
+        embeds,
       });
       log('INFO', `Stats message posted: ${statsMessage.id}`);
     }
 
-    if (online) {
-      updatePresence(stats?.playingPlayers ?? 0);
-    } else {
-      client.user?.setPresence({ status: 'dnd', activities: [{ name: 'Node Offline', type: ActivityType.Watching }] });
-    }
+    updatePresence(nodes);
   } catch (err) {
     log('ERR', `Failed to send/edit stats message: ${err.message}`);
 
@@ -174,7 +218,9 @@ async function cleanOldMessages(channel) {
 client.once('ready', async () => {
   log('INFO', `Logged in as ${client.user.tag}`);
   log('INFO', `Targeting channel: ${CONFIG.discord.channelId}`);
-  log('INFO', `Lavalink node: ${HOST_LABEL}`);
+  for (const node of nodes) {
+    log('INFO', `Lavalink node [${node.index}]: ${node.hostLabel} (${node.config.name})`);
+  }
   log('INFO', `Update interval: ${CONFIG.updateInterval}ms`);
 
   const channel = client.channels.cache.get(CONFIG.discord.channelId);
@@ -185,12 +231,15 @@ client.once('ready', async () => {
 
   await cleanOldMessages(channel);
 
-  try {
-    cachedInfo = await lavalink.getInfo();
-    log('INFO', `Connected to Lavalink v${cachedInfo?.version?.semver ?? '?'}`);
-  } catch (err) {
-    log('WARN', `Could not fetch initial Lavalink info: ${err.message}`);
-  }
+  // Fetch initial info for all nodes in parallel
+  await Promise.all(nodes.map(async node => {
+    try {
+      node.cachedInfo = await node.client.getInfo();
+      log('INFO', `[Node ${node.index}] Connected to Lavalink v${node.cachedInfo?.version?.semver ?? '?'}`);
+    } catch (err) {
+      log('WARN', `[Node ${node.index}] Could not fetch initial Lavalink info: ${err.message}`);
+    }
+  }));
 
   await refreshStatsEmbed();
 
@@ -208,16 +257,17 @@ async function shutdown(signal) {
   if (updateTimer) clearInterval(updateTimer);
 
   if (statsMessage) {
-    const offlineEmbed = buildStatsEmbed({
+    const offlineEmbeds = nodes.map(node => buildStatsEmbed({
       stats: null,
-      info: cachedInfo,
+      info: node.cachedInfo,
       players: [],
       online: false,
-      nodeName: CONFIG.nodeName,
-      host: HOST_LABEL,
+      nodeName: node.config.name,
+      host: node.hostLabel,
       error: 'Bot is shutting down',
-    });
-    await statsMessage.edit({ embeds: [offlineEmbed] }).catch(() => null);
+      updateInterval: CONFIG.updateInterval,
+    }));
+    await statsMessage.edit({ embeds: offlineEmbeds }).catch(() => null);
   }
 
   await client.destroy();
